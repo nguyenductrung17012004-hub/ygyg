@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================
+# ENVIRONMENT (MDP)
+# =========================
+class VRPDEnv:
+    def __init__(self, n_customers=10, n_trucks=2, n_drones=2):
+        self.n = n_customers
+        self.K = n_trucks
+        self.D = n_drones
+        self.reset()
+
+    def reset(self):
+        self.coords = torch.rand(self.n + 1, 2).to(device)
+        self.visited = torch.zeros(self.n + 1).to(device)
+
+        self.truck_pos = [0 for _ in range(self.K)]
+        self.drone_battery = [[1.0 for _ in range(self.D)] for _ in range(self.K)]
+
+        return self.get_state()
+
+    def get_state(self):
+        return self.coords
+
+    def step(self, actions):
+        reward = 0
+        for k in range(self.K):
+            node = actions[k]
+            if self.visited[node] == 0:
+                self.visited[node] = 1
+                reward -= torch.norm(self.coords[self.truck_pos[k]] - self.coords[node])
+                self.truck_pos[k] = node
+        done = self.visited.sum() == self.n + 1
+        return self.get_state(), reward, done
+
+# =========================
+# ATTENTION ENCODER
+# =========================
+class Encoder(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.fc = nn.Linear(2, embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, 8, batch_first=True)
+
+    def forward(self, x):
+        h = self.fc(x)
+        h, _ = self.attn(h, h, h)
+        return h
+
+# =========================
+# DECODER (LSTM)
+# =========================
+class Decoder(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.lstm = nn.LSTMCell(embed_dim, embed_dim)
+        self.W = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, emb, visited):
+        B, N, E = emb.shape
+
+        h = torch.zeros(B, E).to(device)
+        c = torch.zeros(B, E).to(device)
+
+        logits = []
+        actions = []
+        log_probs = []
+
+        for _ in range(N):
+            h, c = self.lstm(emb[:,0,:], (h, c))
+
+            scores = torch.matmul(self.W(h).unsqueeze(1), emb.transpose(1,2)).squeeze(1)
+
+            scores = scores - 1e9 * visited
+
+            probs = torch.softmax(scores, dim=1)
+
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+
+            actions.append(action)
+            log_probs.append(dist.log_prob(action))
+
+            visited = visited.clone()
+            visited[range(B), action] = 1
+
+        return torch.stack(actions,1), torch.stack(log_probs,1)
+
+# =========================
+# CRITIC NETWORK
+# =========================
+class Critic(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, 1)
+
+    def forward(self, emb):
+        return self.fc(emb.mean(dim=1)).squeeze()
+
+# =========================
+# MODEL
+# =========================
+class VRPDModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+        self.critic = Critic()
+
+    def forward(self, x, visited):
+        emb = self.encoder(x)
+        actions, log_probs = self.decoder(emb, visited)
+        value = self.critic(emb)
+        return actions, log_probs, value
+
+# =========================
+# TRAIN
+# =========================
+env = VRPDEnv()
+model = VRPDModel().to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+for epoch in range(500):
+
+    state = env.reset().unsqueeze(0)
+    visited = torch.zeros(1, env.n + 1).to(device)
+
+    actions, log_probs, value = model(state, visited)
+
+    total_reward = 0
+    done = False
+
+    for t in range(actions.size(1)):
+        act = actions[:,t]
+        state, reward, done = env.step(act)
+        total_reward += reward
+        if done:
+            break
+
+    advantage = total_reward - value
+
+    actor_loss = -(log_probs.sum() * advantage.detach())
+    critic_loss = advantage.pow(2)
+
+    loss = actor_loss + critic_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch}, Reward: {total_reward.item():.2f}")
+
+# =========================
+# TEST
+# =========================
+state = env.reset().unsqueeze(0)
+visited = torch.zeros(1, env.n + 1).to(device)
+
+actions, _, _ = model(state, visited)
+
+print("\nRoute:", actions[0].tolist())
