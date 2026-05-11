@@ -5,9 +5,6 @@ import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =========================
-# ENVIRONMENT (MDP)
-# =========================
 class VRPDEnv:
     def __init__(self, n_customers=10, n_trucks=2, n_drones=2):
         self.n = n_customers
