@@ -1,218 +1,168 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
 
-# C extensions
-*.so
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# =========================
+# ENVIRONMENT (MDP)
+# =========================
+class VRPDEnv:
+    def __init__(self, n_customers=10, n_trucks=2, n_drones=2):
+        self.n = n_customers
+        self.K = n_trucks
+        self.D = n_drones
+        self.reset()
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+    def reset(self):
+        self.coords = torch.rand(self.n + 1, 2).to(device)
+        self.visited = torch.zeros(self.n + 1).to(device)
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+        self.truck_pos = [0 for _ in range(self.K)]
+        self.drone_battery = [[1.0 for _ in range(self.D)] for _ in range(self.K)]
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+        return self.get_state()
 
-# Translations
-*.mo
-*.pot
+    def get_state(self):
+        return self.coords
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+    def step(self, actions):
+        reward = 0
+        for k in range(self.K):
+            node = actions[k]
+            if self.visited[node] == 0:
+                self.visited[node] = 1
+                reward -= torch.norm(self.coords[self.truck_pos[k]] - self.coords[node])
+                self.truck_pos[k] = node
+        done = self.visited.sum() == self.n + 1
+        return self.get_state(), reward, done
 
-# Flask stuff:
-instance/
-.webassets-cache
+# =========================
+# ATTENTION ENCODER
+# =========================
+class Encoder(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.fc = nn.Linear(2, embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, 8, batch_first=True)
 
-# Scrapy stuff:
-.scrapy
+    def forward(self, x):
+        h = self.fc(x)
+        h, _ = self.attn(h, h, h)
+        return h
 
-# Sphinx documentation
-docs/_build/
+# =========================
+# DECODER (LSTM)
+# =========================
+class Decoder(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.lstm = nn.LSTMCell(embed_dim, embed_dim)
+        self.W = nn.Linear(embed_dim, embed_dim)
 
-# PyBuilder
-.pybuilder/
-target/
+    def forward(self, emb, visited):
+        B, N, E = emb.shape
 
-# Jupyter Notebook
-.ipynb_checkpoints
+        h = torch.zeros(B, E).to(device)
+        c = torch.zeros(B, E).to(device)
 
-# IPython
-profile_default/
-ipython_config.py
+        logits = []
+        actions = []
+        log_probs = []
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+        for _ in range(N):
+            h, c = self.lstm(emb[:,0,:], (h, c))
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+            scores = torch.matmul(self.W(h).unsqueeze(1), emb.transpose(1,2)).squeeze(1)
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+            scores = scores - 1e9 * visited
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+            probs = torch.softmax(scores, dim=1)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+            actions.append(action)
+            log_probs.append(dist.log_prob(action))
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+            visited = visited.clone()
+            visited[range(B), action] = 1
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        return torch.stack(actions,1), torch.stack(log_probs,1)
 
-# Redis
-*.rdb
-*.aof
-*.pid
+# =========================
+# CRITIC NETWORK
+# =========================
+class Critic(nn.Module):
+    def __init__(self, embed_dim=128):
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, 1)
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+    def forward(self, emb):
+        return self.fc(emb.mean(dim=1)).squeeze()
 
-# ActiveMQ
-activemq-data/
+# =========================
+# MODEL
+# =========================
+class VRPDModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder()
+        self.critic = Critic()
 
-# SageMath parsed files
-*.sage.py
+    def forward(self, x, visited):
+        emb = self.encoder(x)
+        actions, log_probs = self.decoder(emb, visited)
+        value = self.critic(emb)
+        return actions, log_probs, value
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# =========================
+# TRAIN
+# =========================
+env = VRPDEnv()
+model = VRPDModel().to(device)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-# Rope project settings
-.ropeproject
+for epoch in range(500):
 
-# mkdocs documentation
-/site
+    state = env.reset().unsqueeze(0)
+    visited = torch.zeros(1, env.n + 1).to(device)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+    actions, log_probs, value = model(state, visited)
 
-# Pyre type checker
-.pyre/
+    total_reward = 0
+    done = False
 
-# pytype static type analyzer
-.pytype/
+    for t in range(actions.size(1)):
+        act = actions[:,t]
+        state, reward, done = env.step(act)
+        total_reward += reward
+        if done:
+            break
 
-# Cython debug symbols
-cython_debug/
+    advantage = total_reward - value
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+    actor_loss = -(log_probs.sum() * advantage.detach())
+    critic_loss = advantage.pow(2)
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+    loss = actor_loss + critic_loss
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
-# Ruff stuff:
-.ruff_cache/
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch}, Reward: {total_reward.item():.2f}")
 
-# PyPI configuration file
-.pypirc
+# =========================
+# TEST
+# =========================
+state = env.reset().unsqueeze(0)
+visited = torch.zeros(1, env.n + 1).to(device)
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+actions, _, _ = model(state, visited)
 
-# Streamlit
-.streamlit/secrets.toml
+print("\nRoute:", actions[0].tolist())
